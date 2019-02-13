@@ -52,9 +52,10 @@ def load_X_y():
 def train():
     # prepare_dataset()
     X, y = load_X_y()
-    y_oh = np.eye(2)[y.astype(int)]  # one hot
+    y_oh = np.eye(2, dtype=np.float32)[y.astype(int)]  # one hot
+
     predictor = RnnPredictor()
-    predictor.train(X, y_oh, epoches=1)
+    predictor.train(X, y_oh, epoches=50)
 
 
 if __name__ == "__main__":

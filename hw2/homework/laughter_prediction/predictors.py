@@ -1,3 +1,5 @@
+import glob
+
 import numpy as np
 
 from sklearn.externals import joblib
@@ -7,7 +9,8 @@ import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 
 
 class Predictor:
@@ -99,8 +102,8 @@ class RnnPredictor(Predictor):
         :param epoches: int
         """
         if self.model is None:
-            self.model = GRUTagger(frame_features_size=audios.shape[0, 0], hidden_size=10,
-                                   tagset_size=all_tags.shape[0, 0])
+            self.model = GRUTagger(n_features=audios.shape[-1], hidden_size=10,
+                                   n_classes=2).to(device)
 
         loss_function = nn.NLLLoss()
         optimizer = optim.SGD(self.model.parameters(), lr=0.1)
@@ -108,42 +111,72 @@ class RnnPredictor(Predictor):
         for epoch in range(epoches):
             for frames, tags in zip(audios, all_tags):
                 self.model.zero_grad()
-                self.model.hidden = self.model.init_hidden()
+                hidden = self.model.init_hidden(batch_size=1)
 
-                tags_ = self.model(frames)
+                tags_ = self.model(frames, hidden)
 
                 loss = loss_function(tags_, tags)
                 loss.backward()
                 optimizer.step()
 
-    def predict(self, seq_of_features):
-        with torch.no_grad():
-            tags_probs = self.model(seq_of_features)
-        return torch.argmax(tags_probs)
+    def predict(self, audio):
+        batch_size = 1
+        audio = torch.unsqueeze(torch.tensor(audio).to(device), batch_size)
+        print("RnnPredictor.predict", audio.shape)
 
-    def predict_proba(self, seq_of_features):
+        if self.model is None:
+            self.model = GRUTagger(n_features=audio.shape[-1], hidden_size=10,
+                                   n_classes=2).to(device)
+
         with torch.no_grad():
-            tags_probs = self.model(seq_of_features)
+            tags_probs = self.model(audio, self.model.init_hidden(batch_size))
+
+        tags_probs = torch.squeeze(tags_probs)
+        result = tags_probs >= 0.5
+        return result[:, 1]
+
+    def predict_proba(self, audio):
+        batch_size = 1
+        audio = torch.unsqueeze(torch.tensor(audio).to(device), batch_size)
+
+        if self.model is None:
+            self.model = GRUTagger(n_features=audio.shape[-1], hidden_size=10,
+                                   n_classes=2).to(device)
+        with torch.no_grad():
+            tags_probs = self.model(audio, self.model.init_hidden(batch_size))
+
         return tags_probs
 
 
 # seq of frames features -> seq of tags
 class GRUTagger(nn.Module):
-    def __init__(self, frame_features_size, hidden_size, tagset_size):
+    def __init__(self, n_features, hidden_size, n_classes):
         super(GRUTagger, self).__init__()
-        self.frame_features_size = frame_features_size
+        self.n_features = n_features
         self.hidden_size = hidden_size
-        self.tagset_size = tagset_size
+        self.k_classes = n_classes
 
-        self.gru = nn.GRU(frame_features_size, hidden_size)
-        self.linear = nn.Linear(hidden_size, tagset_size)
-        self.hidden = self.init_hidden()
+        self.gru = nn.GRU(n_features, hidden_size)
+        self.linear = nn.Linear(hidden_size, n_classes)
 
-    def forward(self, input_seq):
-        gru_out, hidden = self.gru(input_seq, self.hidden)
+    def forward(self, audios, hidden):
+        """
+
+        :param audios: (audio_length, batch, n_features)
+        :return:
+        """
+        print("GRUTagger.forward", audios.shape, hidden.shape, self.gru.input_size, self.gru.hidden_size)
+        gru_out, hidden = self.gru(audios.float(), hidden)
         out = self.linear(gru_out)
-        tags_probs = F.log_softmax(out)
+        # tags_probs = F.log_softmax(out, dim=2)
+        tags_probs = F.softmax(out, dim=2)
         return tags_probs
 
-    def init_hidden(self):
-        return torch.randn(1, 1, self.hidden_size, device=device)
+    def init_hidden(self, batch_size):
+        """
+
+        :return:(num_layers * num_directions, batch, hidden_size)
+        """
+        return torch.randn(1, batch_size, self.hidden_size, device=device).float()
+
+

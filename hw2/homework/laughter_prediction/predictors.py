@@ -1,4 +1,5 @@
 import glob
+import os
 
 import numpy as np
 
@@ -7,12 +8,9 @@ from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 from torch import optim
-import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# device = torch.device("cpu")
 
 
 class Predictor:
@@ -86,16 +84,16 @@ class StrictLargeXgboostPredictor(XgboostPredictor):
 
 
 class RnnPredictor(Predictor):
-    def __init__(self, model_path=None):
+    def __init__(self, model_path="rnn_model"):
         self.model_path = model_path
         self.model = None
-        if model_path is not None:
-            self.model = torch.load(self.model_path)
 
     def save(self):
         torch.save(self.model.state_dict(), self.model_path)
 
-    def train(self, audios, all_tags, batch_size=2, epoches=30):
+    def train(self, audios_mfcc, audios_fbank, all_tags,
+              audios_mfcc_test, audios_fbank_test, all_tags_test,
+              batch_size=2, epoches=30, hidden_size=10):
         """
         :param audios: np.array shape=[n_audios, m_frames, k_features]
                         m_frames - individual for each audio, k_features - same for all audios and frames
@@ -103,98 +101,116 @@ class RnnPredictor(Predictor):
                         m_frames - individual for each audio, k_classes - same for all audios and frames
         :param epoches: int
         """
-        n_audios, audio_length, k_features = audios.shape
-        n_audios, audio_length, k_classes = all_tags.shape
+        _, _, mfcc_k_features = audios_mfcc.shape
+        _, _, fbank_k_features = audios_fbank.shape
+        n_audios, audio_length = all_tags.shape
 
-        audios = torch.tensor(audios).to(device)
+        audios_mfcc = torch.tensor(audios_mfcc).to(device)
+        audios_fbank = torch.tensor(audios_fbank).to(device)
         all_tags = torch.tensor(all_tags).to(device)
+
+        audios_mfcc_test = torch.tensor(audios_mfcc_test).to(device)
+        audios_fbank_test = torch.tensor(audios_fbank_test).to(device)
+        all_tags_test = torch.tensor(all_tags_test).to(device)
+
         if self.model is None:
-            self.model = GRUTagger(n_features=audios.shape[-1], hidden_size=10,
-                                   n_classes=2).to(device)
+            self.model = GRUTagger(n_features_mfcc=mfcc_k_features, n_features_fbank=fbank_k_features,
+                                   hidden_size=hidden_size).to(device)
+        if self.model_path and os.path.isfile(self.model_path):
+            self.model.load_state_dict(torch.load(self.model_path))
+            print("loading..")
 
         loss_function = nn.BCELoss()
-        # optimizer = optim.SGD(self.model.parameters(), lr=0.1)
         optimizer = optim.Adam(self.model.parameters())
 
         for epoch in range(epoches):
+            # TEST
+            with torch.no_grad():
+                y_mfcc, y_global = self.model(audios_mfcc_test, audios_fbank_test)
+                loss_mfcc = loss_function(y_mfcc, all_tags_test)
+                loss_global = loss_function(y_global, all_tags_test)
+
+            y_mfcc, y_global = y_mfcc.cpu().numpy(), y_global.cpu().numpy()
+            y_true = all_tags_test.cpu().numpy()
+
+            auc_mfcc = roc_auc_score(y_true, y_mfcc)
+            auc_global = roc_auc_score(y_true, y_global)
+
+            print("##########################################################################3")
+            print(f"##### TEST: epoch {epoch} loss_mfcc {loss_mfcc.item():.5} loss {loss_global.item():.5} "
+                  f"auc_mfcc {auc_mfcc:.3} auc_global {auc_global:.3} #####")
+            print("##########################################################################3")
+
+            # prepare data
+            permutation = np.random.permutation(n_audios)
+
+            audios_mfcc = audios_mfcc[permutation]
+            audios_fbank = audios_fbank[permutation]
+            all_tags = all_tags[permutation]
+
+            # train by batches
             for idx in range(0, n_audios, batch_size):
-                batch_X = audios[idx: idx + batch_size]
+                batch_X_mfcc = audios_mfcc[idx: idx + batch_size]
+                batch_X_fbank = audios_fbank[idx: idx + batch_size]
                 batch_y = all_tags[idx: idx + batch_size]
 
-                # batch_X = torch.unsqueeze(batch_X, 1)
-                batch_X = batch_X.transpose(0, 1)
-                # tags = torch.unsqueeze(tags, 1)
-
                 self.model.zero_grad()
-                hidden = self.model.init_hidden(batch_size=batch_X.shape[-2])
+                y_mfcc, y_global = self.model(batch_X_mfcc, batch_X_fbank)
 
-                batch_y_ = self.model(batch_X, hidden)
+                loss_mfcc = loss_function(y_mfcc, batch_y)
+                loss_global = loss_function(y_global, batch_y)
 
-                # tags_[:]=0
-                # tags[:]=0.99
-
-                # print("before loss:", (batch_y_ > 1).sum(), (batch_y > 1).sum(), batch_y_.dtype, batch_y.dtype)
-                loss = loss_function(batch_y_, batch_y)
-                loss.backward()
+                loss_mfcc.backward(retain_graph=True)
+                loss_global.backward()
                 optimizer.step()
-                print(f"epoch {epoch} batch {idx} loss {loss.item()}")
+                if idx // batch_size % 20 == 0:
+                    print(f"epoch {epoch} batch {idx} loss_mfcc {loss_mfcc.item():.3} loss {loss_global.item():.3}")
 
-    def predict(self, audio):
-        batch_size = 1
-        audio = torch.unsqueeze(torch.tensor(audio).to(device), 1)
-        print("RnnPredictor.predict", audio.shape)
+        self.save()
 
-        if self.model is None:
-            self.model = GRUTagger(n_features=audio.shape[-1], hidden_size=10,
-                                   n_classes=2).to(device)
+    def predict(self, audios_mfcc, audios_fbank):
+        return NotImplementedError()
 
-        with torch.no_grad():
-            tags_probs = self.model(audio, self.model.init_hidden(batch_size))
-
-        tags_probs = torch.squeeze(tags_probs)
-        result = tags_probs >= 0.5
-        return result[:, 1]
-
-    def predict_proba(self, audio):
-        batch_size = 1
-        audio = torch.unsqueeze(torch.tensor(audio).to(device), 1)
+    def predict_proba(self, audios_mfcc, audios_fbank):
+        audio_mfcc = torch.tensor(audios_mfcc).to(device)
+        audio_fbank = torch.tensor(audios_fbank).to(device)
 
         if self.model is None:
-            self.model = GRUTagger(n_features=audio.shape[-1], hidden_size=10,
-                                   n_classes=2).to(device)
-        with torch.no_grad():
-            tags_probs = self.model(audio, self.model.init_hidden(batch_size))
+            raise RuntimeError("model is not trained")
 
-        return tags_probs
+        with torch.no_grad():
+            y_mfcc, y_global = self.model(audio_mfcc, audio_fbank)
+
+        return y_mfcc.cpu().numpy(), y_global.cpu().numpy()
 
 
 # seq of frames features -> seq of tags
 class GRUTagger(nn.Module):
-    def __init__(self, n_features, hidden_size, n_classes):
+    def __init__(self, n_features_mfcc, n_features_fbank, hidden_size):
         super(GRUTagger, self).__init__()
-        self.n_features = n_features
         self.hidden_size = hidden_size
-        self.n_classes = n_classes
 
-        self.gru = nn.GRU(n_features, hidden_size)
-        self.linear = nn.Linear(hidden_size, n_classes)
+        self.mfcc_gru = nn.GRU(n_features_mfcc, hidden_size, num_layers=1, bidirectional=True, batch_first=True)
 
-    def forward(self, audios, hidden):
+        self.mfcc_linear = nn.Linear(2 * hidden_size, 1)
+
+        self.fbank_gru = nn.GRU(n_features_fbank, hidden_size, num_layers=1, bidirectional=True, batch_first=True)
+
+        self.global_linear = nn.Linear(2 * hidden_size * 2, 1)
+
+    def forward(self, audios_mfcc, audios_fbank):
         """
-
-        :param audios: (audio_length, batch, n_features)
+        :param audios_mfcc: (batch, audio_length, n_features)
+        :param audios_fbank: (batch, audio_length, n_features)
         :return:
         """
-        # print("GRUTagger.forward", audios.shape, hidden.shape, self.gru.input_size, self.gru.hidden_size)
-        out, hidden = self.gru(audios.float(), hidden)
-        out = self.linear(out)
-        # tags_probs = F.log_softmax(out, dim=2)
-        tags_probs = F.softmax(out, dim=2)
-        return tags_probs
+        out_mfcc, hidden_mfcc = self.mfcc_gru(audios_mfcc.float())
+        out_mfcc_n_classes = self.mfcc_linear(out_mfcc)
 
-    def init_hidden(self, batch_size):
-        """
+        out_fbank, hidden_fbank = self.fbank_gru(audios_fbank.float())
+        out_n_classes = self.global_linear(torch.cat((out_mfcc, out_fbank), dim=-1))
 
-        :return:(num_layers * num_directions, batch, hidden_size)
-        """
-        return torch.randn(1, batch_size, self.hidden_size, device=device).float()
+        out_mfcc_probs = torch.sigmoid(out_mfcc_n_classes)
+        out_probs = torch.sigmoid(out_n_classes)
+
+        return torch.squeeze(out_mfcc_probs), torch.squeeze(out_probs)

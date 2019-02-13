@@ -42,30 +42,23 @@ class PyAAExtractor(FeatureExtractor):
 class FBankExtractor(FeatureExtractor):
     """Python Audio Analysis features extractor"""
 
-    def __init__(self):
-        self.n_mels = 102
+    def __init__(self, n_mels):
+        self.n_mels = n_mels
 
     def extract_features(self, wav_path):
-        # y, sr = librosa.load(wav_path)
-        sr, y = wav.read(wav_path)
-        y = y.astype(np.float64)
-        mels = librosa.feature.melspectrogram(y, sr=sr, n_mels=self.n_mels)
-        log_mels = librosa.power_to_db(mels, ref=np.max).T
-        print("FBankExtractor:", log_mels.shape, sr)
-
-        return pd.DataFrame(log_mels)
+        y, sr = librosa.load(wav_path, sr=16000, dtype=float)
+        mels = librosa.feature.melspectrogram(y, sr=sr, n_mels=self.n_mels,hop_length=512)
+        mels = librosa.power_to_db(mels, np.max).T
+        return pd.DataFrame(mels)
 
 
 class MFCCExtractor(FeatureExtractor):
     """Python Audio Analysis features extractor"""
 
-    def __init__(self):
-        self.n_mfcc = 13
+    def __init__(self, n_mfcc):
+        self.n_mfcc = n_mfcc
 
     def extract_features(self, wav_path):
-        # y, sr = librosa.load(wav_path)
-
-        sr, y = wav.read(wav_path)
-        y = y.astype(np.float64)
-        mfcc = librosa.feature.mfcc(y, sr, n_mfcc=self.n_mfcc).T
+        y, sr = librosa.load(wav_path, sr=16000, dtype=float)
+        mfcc = librosa.feature.mfcc(y, sr, n_mfcc=self.n_mfcc, hop_length=512).T
         return pd.DataFrame(mfcc)

@@ -1,0 +1,4 @@
+{
+    "predictor": "predictors.RnnPredictor",
+    "extractor": "feature_extractors.FBankExtractor"
+}
